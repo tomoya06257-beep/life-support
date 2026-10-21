@@ -37,7 +37,7 @@
     st.memo = typeof d.memo === "string" ? d.memo.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").slice(0, 5000) : "";
     var tg = okDate(d.tgen); if (tg) st.tgen = tg;
     st.assist = { off: {}, later: {} };
-    if (d.assist && typeof d.assist === "object") ["resume", "food", "budget", "stock", "busy", "todo", "setup"].forEach(function (k) {
+    if (d.assist && typeof d.assist === "object") ["resume", "food", "budget", "stock", "calendar", "busy", "todo", "setup"].forEach(function (k) {
       if (d.assist.off && d.assist.off[k] === true) st.assist.off[k] = true; var lt = d.assist.later ? okDate(d.assist.later[k]) : ""; if (lt) st.assist.later[k] = lt;
     });
     arr("exp", 20000).forEach(function (e) {
@@ -387,6 +387,7 @@
     box.innerHTML = ""; btns.innerHTML = ""; $("dlgErr").textContent = "";
     (o.fields || []).forEach(function (f) {
       if (f.type === "checks") {
+        if (f.label) { var lb = document.createElement("p"); lb.className = "label"; lb.textContent = f.label; lb.style.margin = "4px 0 0"; box.appendChild(lb) }
         var g = document.createElement("div"); g.className = "dlg-checks"; g.dataset.field = f.id;
         f.options.forEach(function (op) {
           var l = document.createElement("label"), cb = document.createElement("input"), t = document.createElement("span"); l.className = "dlg-check";
@@ -394,7 +395,7 @@
         });
         if (f.selectAll) {
           var all = document.createElement("button"); all.type = "button"; all.className = "linkbtn"; all.textContent = [].some.call(g.querySelectorAll("input"), function (c) { return !c.checked }) ? "すべて選ぶ" : "すべて解除";
-          all.addEventListener("click", function () { var cs = g.querySelectorAll("input"), on = [].some.call(cs, function (c) { return !c.checked }); [].forEach.call(cs, function (c) { c.checked = on }); all.textContent = on ? "すべて解除" : "すべて選ぶ" });
+          all.addEventListener("click", function () { var cs = g.querySelectorAll("input"), on = [].some.call(cs, function (c) { return !c.checked });[].forEach.call(cs, function (c) { c.checked = on }); all.textContent = on ? "すべて解除" : "すべて選ぶ" });
           box.appendChild(all);
         }
         box.appendChild(g); return;
@@ -463,6 +464,106 @@
     sync();
   })();
 
+  /* ---- 期限・買い時を、スマホのカレンダーに、通知つきで追加する(.ics ファイル) ----
+     アプリを閉じていても、カレンダーが、決めた時刻に通知してくれる。サーバーは、使わない。
+     前に書き出した内容を、この端末に覚えておき、食材や日用品が変わったら、「更新してください」と知らせる。 */
+  function icsEsc(t) { return String(t).replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n") }
+  function icsFold(line) {   /* 1行は75バイトまで。超えたら折り返す(日本語の文字の途中では、切らない) */
+    var enc = new TextEncoder(), out = [], cur = "", bytes = 0;
+    Array.from(line).forEach(function (ch) {
+      var b = enc.encode(ch).length, lim = out.length ? 74 : 75;
+      if (bytes + b > lim) { out.push(cur); cur = ch; bytes = b } else { cur += ch; bytes += b }
+    });
+    out.push(cur); return out.join("\r\n ");
+  }
+  function pad2(n) { return ("0" + n).slice(-2) }
+  function icsDT(dateStr, hour, min) { return dateStr.replace(/-/g, "") + "T" + pad2(hour) + pad2(min || 0) + "00" }
+  function mdOf(dateStr) { return (+dateStr.slice(5, 7)) + "/" + (+dateStr.slice(8)) }
+  function buildReminders(opt) {   /* opt: { lead(何日前), hour(何時), fridge, stock } */
+    var ev = [], skipped = 0, now = new Date();
+    function add(uid, name, kind, due, title, desc) {
+      var date = addDays(due, -opt.lead);
+      if (new Date(date + "T" + pad2(opt.hour) + ":00:00") <= now) { skipped++; return }   /* 通知の時刻が、もう過ぎている */
+      ev.push({ uid: uid, name: name, kind: kind, due: due, date: date, start: icsDT(date, opt.hour, 0), end: icsDT(date, opt.hour, 30), title: title, desc: desc });
+    }
+    if (opt.fridge) S.fridge.forEach(function (x) {
+      if (!x.exp) return;
+      add("ls-fr-" + x.id + "@life-support", x.name, "fr", x.exp, "【冷蔵庫】" + x.name + "の賞味期限" + (x.est ? "(目安)" : "") + "は " + mdOf(x.exp) + " です",
+        "冷蔵庫の「" + x.name + "」の賞味期限" + (x.est ? "(目安)" : "") + "は " + x.exp + " です。実際の期限は、パッケージで確認してください。(Life Support)");
+    });
+    if (opt.stock) S.stock.forEach(function (k) {
+      var due = addDays(k.bought, stockState(k).c);
+      add("ls-st-" + k.id + "@life-support", k.name, "st", due, "【日用品】" + k.name + "の買い時(目安)は " + mdOf(due) + " ごろです",
+        "日用品の「" + k.name + "」は、" + due + " ごろに、買い直す目安です(推定です。実際の残りとは、ちがうことがあります)。(Life Support)");
+    });
+    var stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"), seq = Math.floor(Date.now() / 60000);   /* SEQUENCE: 書き出すたびに、大きくなる番号(更新だと、カレンダーに伝える) */
+    var L = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Life Support//JP", "CALSCALE:GREGORIAN", "METHOD:PUBLISH", "X-WR-CALNAME:Life Support"];
+    ev.forEach(function (e) {
+      L.push("BEGIN:VEVENT", "UID:" + e.uid, "DTSTAMP:" + stamp, "LAST-MODIFIED:" + stamp, "SEQUENCE:" + seq, "DTSTART:" + e.start, "DTEND:" + e.end, "SUMMARY:" + icsEsc(e.title), "DESCRIPTION:" + icsEsc(e.desc),
+        "BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:" + icsEsc(e.title), "TRIGGER:PT0M", "END:VALARM", "END:VEVENT");
+    });
+    L.push("END:VCALENDAR");
+    return { text: L.map(icsFold).join("\r\n") + "\r\n", count: ev.length, skipped: skipped, events: ev };
+  }
+  function downloadICS(text) {
+    var blob = new Blob([text], { type: "text/calendar;charset=utf-8" }), url = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = url; a.download = "life-support-reminders.ics"; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url) }, 4000);
+  }
+  /* 前回、カレンダー用に書き出した内容(この端末にだけ覚えておく) */
+  function calRead() { try { return JSON.parse(localStorage.getItem("ls_cal_export") || "null") } catch (e) { return null } }
+  function calWrite(opt, events) {
+    var items = {}; events.forEach(function (e) { items[e.uid] = { n: e.name, d: e.date } });
+    try { localStorage.setItem("ls_cal_export", JSON.stringify({ opt: opt, at: today, items: items })) } catch (e) { }
+  }
+  function exportReminders(o) {
+    var r = buildReminders(o); if (!r.count) return r;
+    try { localStorage.setItem("ls_cal_pref", JSON.stringify({ lead: o.lead, hour: o.hour })) } catch (e) { }
+    downloadICS(r.text); calWrite(o, r.events); return r;
+  }
+  /* 前回の書き出しと、いまの冷蔵庫・日用品を比べて、カレンダーの予定が古くなっていないか調べる */
+  function calStatus() {
+    var ex = calRead(); if (!ex || !ex.opt || !ex.items) return null;
+    var cur = buildReminders(ex.opt), map = {}, now = new Date(), changed = [], added = [], removed = [];
+    cur.events.forEach(function (e) { map[e.uid] = e });
+    Object.keys(ex.items).forEach(function (uid) {
+      var it = ex.items[uid]; if (new Date(it.d + "T" + pad2(ex.opt.hour) + ":00:00") <= now) return;   /* もう通知された予定は、気にしない */
+      if (!map[uid]) removed.push(it.n); else if (map[uid].date !== it.d) changed.push(it.n);
+    });
+    cur.events.forEach(function (e) { if (!ex.items[e.uid]) added.push(e.name) });
+    return { ex: ex, changed: changed, added: added, removed: removed, n: changed.length + added.length + removed.length };
+  }
+  function calStaleText(cs) {
+    var t = [];
+    if (cs.removed.length) t.push("【なくなった・通知の対象から外れたもの】\n・" + cs.removed.join("\n・"));
+    if (cs.changed.length) t.push("【日付が変わったもの】\n・" + cs.changed.join("\n・"));
+    return t.join("\n\n");
+  }
+  function openReminderDialog(which) {
+    var pref = {}, ex = calRead(); try { pref = JSON.parse(localStorage.getItem("ls_cal_pref") || "{}") } catch (e) { }
+    openDialog({
+      title: "期限・買い時を、カレンダーで通知する",
+      msg: "いまの冷蔵庫と日用品から、カレンダー用のファイルを作ります。スマホで開いて、カレンダーに追加すると、アプリを開いていなくても、決めた時刻に、通知が来ます。\n" +
+        "おすすめ: カレンダーアプリで、「Life Support」という専用のカレンダーを作り、追加するときに、それを選びます。更新するときは、専用カレンダーの予定を消してから、新しいファイルを追加すると、古い予定が残りません。\n" +
+        "食材や日用品が変わると、アプリのホームで、「カレンダーの更新」をお知らせします。" + (ex && ex.items ? "\n前回は " + mdOf(ex.at) + " に、" + Object.keys(ex.items).length + "件を書き出しました。" : ""),
+      fields: [
+        { id: "lead", type: "select", label: "いつ通知しますか", value: String(pref.lead != null ? pref.lead : 1), options: [{ value: "0", label: "期限・買い時の当日" }, { value: "1", label: "1日前" }, { value: "2", label: "2日前" }, { value: "3", label: "3日前" }] },
+        { id: "hour", type: "select", label: "何時に通知しますか", value: String(pref.hour != null ? pref.hour : 8), options: [7, 8, 9, 12, 18].map(function (h) { return { value: String(h), label: h + ":00" } }) },
+        { id: "what", type: "checks", label: "通知するもの", options: [{ value: "fridge", label: "冷蔵庫の食材(賞味期限)", checked: which !== "stock" }, { value: "stock", label: "日用品の買い時", checked: which !== "fridge" }] }],
+      buttons: [{ label: "やめる" }, {
+        label: "ファイルを作る", primary: true, fn: function (v) {
+          if (!v.what.length) return "通知するものを、選んでください";
+          var o = { lead: +v.lead, hour: +v.hour, fridge: v.what.indexOf("fridge") >= 0, stock: v.what.indexOf("stock") >= 0 }, r = exportReminders(o);
+          if (!r.count) return "通知できるものが、ありません(期限や買い時が、まだ先の食材・日用品を、登録してください)";
+          showToast(r.count + "件の通知用ファイルを作りました。開いて、カレンダーに追加してください" + (r.skipped ? "(時刻が過ぎたもの " + r.skipped + "件は、除きました)" : ""), null);
+          renderAssist();
+        }
+      }]
+    });
+  }
+  $("remFr").addEventListener("click", function () { openReminderDialog("fridge") });
+  $("remSt").addEventListener("click", function () { openReminderDialog("stock") });
+
   /* ---- 今日の生活アシスト(保存されているデータだけを使った、ルールベースの提案) ---- */
   var QUICK = ["スクランブルエッグ", "冷ややっこ", "チーズオムレツ", "キャベツと卵の炒め物", "ひき肉とキャベツの炒め物", "野菜炒め"];   /* 作る時間が短い料理(目安。筆者の判断) */
   var RESUME_DAYS = 0;
@@ -508,6 +609,11 @@
       var pend = due.filter(function (k) { return !S.shop.some(function (x) { return x.name === k.name && !x.bought }) });
       out.push({ kind: "stock", pr: 3, icon: "🧻", title: nameList(due, 3) + " が、買い時です", why: "買ってから、目安の日数がたちました(推定です。実際の残りとは、ちがうことがあります)", acts: [pend.length ? { label: "買い物リストに入れる", run: "stock" } : { label: "買い物リストを見る", run: "shopgo" }] });
     }
+    var cs = calStatus();
+    if (cs && cs.n && !hid("calendar")) {
+      var parts = []; if (cs.changed.length) parts.push("日付が変わったもの " + cs.changed.length + "件"); if (cs.removed.length) parts.push("なくなったもの " + cs.removed.length + "件"); if (cs.added.length) parts.push("新しく増えたもの " + cs.added.length + "件");
+      out.push({ kind: "calendar", pr: 3.5, icon: "🔔", title: "カレンダーの通知を、更新したほうがよさそうです", why: "前に書き出したあとで、" + parts.join("・") + "があります。更新ファイルを作って、カレンダーに追加してください", acts: [{ label: "更新ファイルを作る", run: "calupdate" }].concat(cs.changed.length || cs.removed.length ? [{ label: "消す予定を見る", run: "calstale" }] : []) });
+    }
     var ts = S.sched.filter(function (s) { return s.date === today });
     if (ts.length >= 3 && !S.meals[today] && !hid("busy")) {
       var q = RECIPES.filter(function (r) { return QUICK.indexOf(r[0]) >= 0 && fridgeHas(r) });
@@ -523,19 +629,27 @@
   function goTab(t) { document.querySelector('.tab[data-t="' + t + '"]').click() }
   function tidyTodos() {
     var u = S.todos.filter(function (t) { return !t.done });
-    openDialog({ title: "やることを整理する", msg: "今日はやらないものを選ぶと、リストから外します。外したあとも、「元に戻す」で戻せます。", fields: [{ id: "ids", type: "checks", selectAll: true, options: u.map(function (t) { return { value: t.id, label: t.text + (t.date < today ? "(" + (+t.date.slice(5, 7)) + "/" + (+t.date.slice(8)) + "から)" : "") } }) }],
-      buttons: [{ label: "やめる" }, { label: "選んだものを外す", primary: true, fn: function (v) {
-        if (!v.ids.length) return "外すものを選んでください";
-        undoable(v.ids.length + "件を外しました", function () { S.todos = S.todos.filter(function (t) { return v.ids.indexOf(t.id) < 0 }) });
-      } }] });
+    openDialog({
+      title: "やることを整理する", msg: "今日はやらないものを選ぶと、リストから外します。外したあとも、「元に戻す」で戻せます。", fields: [{ id: "ids", type: "checks", selectAll: true, options: u.map(function (t) { return { value: t.id, label: t.text + (t.date < today ? "(" + (+t.date.slice(5, 7)) + "/" + (+t.date.slice(8)) + "から)" : "") } }) }],
+      buttons: [{ label: "やめる" }, {
+        label: "選んだものを外す", primary: true, fn: function (v) {
+          if (!v.ids.length) return "外すものを選んでください";
+          undoable(v.ids.length + "件を外しました", function () { S.todos = S.todos.filter(function (t) { return v.ids.indexOf(t.id) < 0 }) });
+        }
+      }]
+    });
   }
   function tidyExpired() {
     var u = S.fridge.filter(function (x) { return x.exp && diff(x.exp) < 0 });
-    openDialog({ title: "期限切れの食材を整理する", msg: "消す食材を選んでください(実際の状態は、パッケージで確認してください)。消したあとも、「元に戻す」で戻せます。", fields: [{ id: "ids", type: "checks", selectAll: true, options: u.map(function (x) { return { value: x.id, label: x.name + "(" + (+x.exp.slice(5, 7)) + "/" + (+x.exp.slice(8)) + (x.est ? "・目安" : "") + ")", checked: true } }) }],
-      buttons: [{ label: "やめる" }, { label: "選んだものを消す", primary: true, fn: function (v) {
-        if (!v.ids.length) return "消す食材を選んでください";
-        undoable(v.ids.length + "品を消しました", function () { S.fridge = S.fridge.filter(function (x) { return v.ids.indexOf(x.id) < 0 }); $("sug").innerHTML = "" });
-      } }] });
+    openDialog({
+      title: "期限切れの食材を整理する", msg: "消す食材を選んでください(実際の状態は、パッケージで確認してください)。消したあとも、「元に戻す」で戻せます。", fields: [{ id: "ids", type: "checks", selectAll: true, options: u.map(function (x) { return { value: x.id, label: x.name + "(" + (+x.exp.slice(5, 7)) + "/" + (+x.exp.slice(8)) + (x.est ? "・目安" : "") + ")", checked: true } }) }],
+      buttons: [{ label: "やめる" }, {
+        label: "選んだものを消す", primary: true, fn: function (v) {
+          if (!v.ids.length) return "消す食材を選んでください";
+          undoable(v.ids.length + "品を消しました", function () { S.fridge = S.fridge.filter(function (x) { return v.ids.indexOf(x.id) < 0 }); $("sug").innerHTML = "" });
+        }
+      }]
+    });
   }
   function runAssist(k) {
     if (k === "food") { goTab("meal"); $("mealSug").click(); return }
@@ -544,6 +658,14 @@
     if (k === "setup") { $("budgetBtn").click(); return }
     if (k === "todo") { tidyTodos(); return }
     if (k === "expired") { tidyExpired(); return }
+    if (k === "calstale") { var c1 = calStatus(); if (c1) info(calStaleText(c1) || "カレンダーから消す予定は、ありません。", "カレンダーで消す予定"); return }
+    if (k === "calupdate") {
+      var c2 = calStatus(); if (!c2) return; var r = exportReminders(c2.ex.opt), stale = calStaleText(c2);
+      if (!r.count) { info("いま通知できるものが、ありません。" + (stale ? "\nカレンダーの、次の古い予定は、消してください。\n\n" + stale : ""), "更新するものがありません"); renderAssist(); return }
+      showToast(r.count + "件の更新用ファイルを作りました。開いて、カレンダーに追加してください", null);
+      if (stale) info("カレンダーの、次の古い予定は、消してください(専用カレンダーを、作り直す方法が、確実です)。\n\n" + stale, "カレンダーで消す予定");
+      renderAssist(); return;
+    }
     if (k === "stock") {
       undoable("買い物リストに入れました", function () { S.stock.filter(function (x) { return stockState(x).due }).forEach(function (x) { if (!S.shop.some(function (y) { return y.name === x.name && !y.bought })) S.shop.push({ id: uid(), name: x.name, bought: false }) }) });
       return;
@@ -577,20 +699,26 @@
   var act = {
     eedit: function (id) {
       var e = S.exp.filter(function (x) { return x.id === id })[0]; if (!e) return;
-      openDialog({ title: "支出を直す", fields: [{ id: "amt", type: "number", label: "金額(円・税込)", value: e.amt }, { id: "memo", type: "text", label: "メモ", value: e.memo || "", max: 100 }, { id: "cat", type: "select", label: "カテゴリ", options: CATS, value: e.cat || "その他" }],
-        buttons: [{ label: "やめる" }, { label: "保存", primary: true, fn: function (v) {
-          var n = parseYen(v.amt); if (isNaN(n)) return YEN_MSG;
-          e.amt = n; e.memo = cleanStr(v.memo, 100); if (CATS.indexOf(v.cat) >= 0) e.cat = v.cat; save(); renderAll(); showToast("直しました", null);
-        } }] });
+      openDialog({
+        title: "支出を直す", fields: [{ id: "amt", type: "number", label: "金額(円・税込)", value: e.amt }, { id: "memo", type: "text", label: "メモ", value: e.memo || "", max: 100 }, { id: "cat", type: "select", label: "カテゴリ", options: CATS, value: e.cat || "その他" }],
+        buttons: [{ label: "やめる" }, {
+          label: "保存", primary: true, fn: function (v) {
+            var n = parseYen(v.amt); if (isNaN(n)) return YEN_MSG;
+            e.amt = n; e.memo = cleanStr(v.memo, 100); if (CATS.indexOf(v.cat) >= 0) e.cat = v.cat; save(); renderAll(); showToast("直しました", null);
+          }
+        }]
+      });
     },
     edel: function (id) { S.exp = by(S.exp, id) },
     tdone: function (id) { S.todos.forEach(function (t) { if (t.id === id) t.done = !t.done }) },
     tdel: function (id) {
       var t = S.todos.filter(function (x) { return x.id === id })[0]; if (!t) return;
       if (t.rid) {
-        openDialog({ title: "くり返しのやること", msg: "「" + t.text + "」は、くり返しの設定があります。どちらにしますか?",
+        openDialog({
+          title: "くり返しのやること", msg: "「" + t.text + "」は、くり返しの設定があります。どちらにしますか?",
           buttons: [{ label: "やめる" }, { label: "今日の分だけ消す", fn: function () { undoable("今日の分を消しました", function () { S.todos = by(S.todos, id) }) } },
-            { label: "今後もやめる", primary: true, fn: function () { undoable("くり返しをやめました", function () { S.rec = by(S.rec, t.rid); S.todos = by(S.todos, id) }) } }] });
+          { label: "今後もやめる", primary: true, fn: function () { undoable("くり返しをやめました", function () { S.rec = by(S.rec, t.rid); S.todos = by(S.todos, id) }) } }]
+        });
         return;
       }
       S.todos = by(S.todos, id);
@@ -606,18 +734,24 @@
     stbuy: function (id) { var k = S.stock.filter(function (x) { return x.id === id })[0]; if (k) addStock(k.name, today) },
     stuse: function (id) {
       var k = S.stock.filter(function (x) { return x.id === id })[0]; if (!k) return;
-      openDialog({ title: "使う量を選ぶ", msg: "目安の日数に反映します(買った間隔が記録されると、自動で、実際の買い方に合っていきます)。",
+      openDialog({
+        title: "使う量を選ぶ", msg: "目安の日数に反映します(買った間隔が記録されると、自動で、実際の買い方に合っていきます)。",
         fields: [{ id: "use", type: "select", label: "使う量", value: k.use || "ふつう", options: [{ value: "少なめ", label: "少なめ" }, { value: "ふつう", label: "ふつう" }, { value: "多め", label: "多め(髪が長い・使う回数が多いなど)" }, { value: "共有", label: "家族・同居人と共有" }] }],
-        buttons: [{ label: "やめる" }, { label: "保存", primary: true, fn: function (v) { if (USELIST.indexOf(v.use) >= 0) k.use = v.use; save(); renderAll() } }] });
+        buttons: [{ label: "やめる" }, { label: "保存", primary: true, fn: function (v) { if (USELIST.indexOf(v.use) >= 0) k.use = v.use; save(); renderAll() } }]
+      });
     },
     stcycle: function (id) {
       var k = S.stock.filter(function (x) { return x.id === id })[0]; if (!k) return;
-      openDialog({ title: "何日ごとに買い足しますか?", fields: [{ id: "n", type: "number", label: "日数(1〜3650)", value: k.manual ? k.cycle : "", note: "空欄にすると、買った間隔から自動で計算します" }],
-        buttons: [{ label: "やめる" }, { label: "保存", primary: true, fn: function (v) {
-          var t = String(v.n).trim(), n = /^\d{1,4}$/.test(t) ? parseInt(t, 10) : NaN;
-          if (t === "") k.manual = false; else if (n >= 1 && n <= 3650) { k.manual = true; k.cycle = n } else return "日数は、1〜3650の整数で入力してください";
-          save(); renderAll();
-        } }] });
+      openDialog({
+        title: "何日ごとに買い足しますか?", fields: [{ id: "n", type: "number", label: "日数(1〜3650)", value: k.manual ? k.cycle : "", note: "空欄にすると、買った間隔から自動で計算します" }],
+        buttons: [{ label: "やめる" }, {
+          label: "保存", primary: true, fn: function (v) {
+            var t = String(v.n).trim(), n = /^\d{1,4}$/.test(t) ? parseInt(t, 10) : NaN;
+            if (t === "") k.manual = false; else if (n >= 1 && n <= 3650) { k.manual = true; k.cycle = n } else return "日数は、1〜3650の整数で入力してください";
+            save(); renderAll();
+          }
+        }]
+      });
     },
     stshop: function (id) { S.stock.forEach(function (k) { if (k.id === id && !S.shop.some(function (x) { return x.name === k.name && !x.bought })) S.shop.push({ id: uid(), name: k.name, bought: false }) }) },
     tofridge: function () { S.shop.filter(function (x) { return x.bought }).forEach(function (x) { var st = S.stock.filter(function (y) { return y.name === x.name })[0]; if (st || kindOf(x.name, "") === "日用品") addStock(x.name, today); else addFridge(x.name, today) }); S.shop = S.shop.filter(function (x) { return !x.bought }) },
@@ -667,11 +801,15 @@
     $("expAmt").value = ""; $("expMemo").value = ""; save(); renderMoney();
   });
   $("budgetBtn").addEventListener("click", function () {
-    openDialog({ title: "今月の予算", fields: [{ id: "n", type: "number", label: "今月使えるお金の総額(円・固定費を含む)", value: S.budget || "" }],
-      buttons: [{ label: "やめる" }, { label: "保存", primary: true, fn: function (v) {
-        var n = parseYen(v.n, 0); if (isNaN(n)) return "予算は、0〜100,000,000円の整数で入力してください";
-        S.budget = n; save(); renderMoney(); showToast("予算を設定しました", null);
-      } }] });
+    openDialog({
+      title: "今月の予算", fields: [{ id: "n", type: "number", label: "今月使えるお金の総額(円・固定費を含む)", value: S.budget || "" }],
+      buttons: [{ label: "やめる" }, {
+        label: "保存", primary: true, fn: function (v) {
+          var n = parseYen(v.n, 0); if (isNaN(n)) return "予算は、0〜100,000,000円の整数で入力してください";
+          S.budget = n; save(); renderMoney(); showToast("予算を設定しました", null);
+        }
+      }]
+    });
   });
   $("todoForm").addEventListener("submit", function (e) {
     e.preventDefault(); var text = $("todoIn").value.trim(); if (!text) return;
@@ -743,11 +881,15 @@
       var r = sanitizeState(d);
       if (!r.ok || !Array.isArray(d.todos)) { info("Life Support のバックアップファイルではないようです。「バックアップを書き出す」で作ったファイルを選んでください。", "読み込めませんでした"); return }
       var n = r.state;
-      openDialog({ title: "バックアップを読み込みます", msg: "現在のデータを置き換えます。\n" + sumTxt(n) + (r.skipped ? "\n(読み込めない項目 " + r.skipped + "件は、読み飛ばします)" : "") + "\n読み込んだあとも、「元に戻す」で、元のデータに戻せます。",
-        buttons: [{ label: "やめる" }, { label: "読み込む", primary: true, fn: function () {
-          var before = JSON.stringify(S); S = n; rollover(); $("memo").value = S.memo; renderAll();
-          showToast("バックアップを読み込みました", function () { S = withDef(JSON.parse(before)); save(); renderAll(); $("memo").value = S.memo });
-        } }] });
+      openDialog({
+        title: "バックアップを読み込みます", msg: "現在のデータを置き換えます。\n" + sumTxt(n) + (r.skipped ? "\n(読み込めない項目 " + r.skipped + "件は、読み飛ばします)" : "") + "\n読み込んだあとも、「元に戻す」で、元のデータに戻せます。",
+        buttons: [{ label: "やめる" }, {
+          label: "読み込む", primary: true, fn: function () {
+            var before = JSON.stringify(S); S = n; rollover(); $("memo").value = S.memo; renderAll();
+            showToast("バックアップを読み込みました", function () { S = withDef(JSON.parse(before)); save(); renderAll(); $("memo").value = S.memo });
+          }
+        }]
+      });
     };
     rd.readAsText(f);
   });
@@ -790,23 +932,28 @@
     };
     var stop = lines.length;
     for (var k = 0; k < lines.length; k++) { if (/小計|合計|お買上|お会計|ご請求/.test(lines[k]) && !/点数|数量|個数/.test(lines[k])) { stop = k; break } }
-    var PRICE_END = /^(.*?[^\d\s¥,.\-])\s*¥?\s*(\d{1,3}(?:,\d{3})+|\d{2,6})\s*(?:[軽※*★☆外内]|\([軽内外]\))?\s*$/;
+    var PRICE_END = /^(.*?[^\d\s¥,.\-])\s*¥?\s*(\d{1,3}(?:,\d{3})+|\d{2,6})\s*(?:[軽※*★☆外内]|\([軽内外]\))?\s*[A-Z]?\s*$/;   /* 末尾の「※ A」のような印も許す */
     var ONLY_NUM = /^[\d\s@x×＠¥,.点個コ\-]*?(\d{1,3}(?:,\d{3})+|\d{2,6})\s*(?:[軽※*★☆外内]|\([軽内外]\))?$/i;
     var items = [], pend = "";
     for (var i = 0; i < stop; i++) {
       var l = lines[i];
+      if (/割引|値引/.test(l)) {   /* 「割引 30% -60」のような行は、直前の品物の金額から引く */
+        var dm = l.match(/[-−―ー一▲△]\s*(\d{1,3}(?:,\d{3})+|\d{1,6})\s*$/);
+        if (dm && items.length) { var np = items[items.length - 1].price - num(dm[1]); if (np > 0) items[items.length - 1].price = np }
+        pend = ""; continue;
+      }
       if (DATE.test(l) || PHONE.test(l) || ADDR.test(l) || NG.test(l)) { pend = ""; continue }
       var s = strip(l), m = s.match(PRICE_END);
       if (m) {
         var nm = clean(m[1]), pr = num(m[2]);
         if (letters(nm) < 2 && pend) nm = clean(pend);
-        if (letters(nm) >= 2 && pr >= 10 && pr <= 100000) items.push({ name: nm, price: pr });
+        if (letters(nm) >= 2 && pr >= 10 && pr <= 100000) items.push({ name: nm, price: pr, red: /[※軽]/.test(l) });
         pend = ""; continue;
       }
       var on = s.match(ONLY_NUM);
       if (on && pend) {
         var p2 = num(on[1]);
-        if (p2 >= 10 && p2 <= 100000 && letters(pend) >= 2) items.push({ name: clean(pend), price: p2 });
+        if (p2 >= 10 && p2 <= 100000 && letters(pend) >= 2) items.push({ name: clean(pend), price: p2, red: /[※軽]/.test(l) });
         pend = ""; continue;
       }
       pend = (letters(l) >= 2 && l.length <= 40 && !/\d\s*[軽※*★☆]?$/.test(l)) ? l : "";
@@ -818,8 +965,16 @@
       var ns = l.match(/\d{1,3}(?:,\d{3})+|\d{2,6}/g) || [];
       if (ns.length) { var v = num(ns[ns.length - 1]); if (v >= 10 && v <= 300000) total = v }
     });
+    var sub = 0, tax = 0, r8 = false, r10 = false;
+    lines.forEach(function (l) {
+      var ns = l.match(/\d{1,3}(?:,\d{3})+|\d{1,6}/g) || [];
+      if (!sub && /小計/.test(l) && ns.length) sub = num(ns[ns.length - 1]);
+      if (/外税/.test(l) && !/対象/.test(l) && ns.length) { var v = num(ns[ns.length - 1]); if (v > 0 && v < 100000) { tax += v; if (/8\s*%/.test(l)) r8 = true; if (/10\s*%/.test(l)) r10 = true } }
+    });
+    var excl = tax > 0 && sub > 0;
+    if (!total && excl) total = sub + tax;   /* 合計の行が読めなくても、小計+外税で求める */
     if (!total && items.length) total = items.reduce(function (a, x) { return a + x.price }, 0);
-    return { total: total, items: items };
+    return { total: total, items: items, excl: excl, only8: r8 && !r10, only10: r10 && !r8 };
   }
   function cropPaper(c) {
     var W = c.width, H = c.height, d = c.getContext("2d").getImageData(0, 0, W, H).data, g = new Uint8Array(W * H), h = new Array(256).fill(0), i, j, k;
@@ -928,7 +1083,8 @@
   var AI_MODEL = "gemini-3.5-flash";
   var AI_THINK = true, acDone = false, aiPs = {};   /* AI_THINK: 考える量を指定する(Gemini 3系は、少ないと速い) */
   function loadAI(level) {
-    level = AI_THINK ? (level || "LOW") : "plain";
+    var ov = ""; try { ov = localStorage.getItem("ls_ai_level") || "" } catch (e) { }   /* ブラウザの localStorage に ls_ai_level(MINIMAL/LOW/MEDIUM)を入れると、考える量を、あとから試せる */
+    level = AI_THINK ? (level || (["MINIMAL", "LOW", "MEDIUM", "HIGH"].indexOf(ov) >= 0 ? ov : "LOW")) : "plain";
     if (!aiPs[level]) aiPs[level] = Promise.all([import(BASE + "firebase-app.js"), import(BASE + "firebase-ai.js"), RC_SITE_KEY ? import(BASE + "firebase-app-check.js") : Promise.resolve(null)]).then(function (m) {
       var app = m[0].getApp(), Sc = m[1].Schema;
       if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
@@ -936,7 +1092,7 @@
       var ai = m[1].getAI(app, { backend: new m[1].GoogleAIBackend() });
       var gc = {
         responseMimeType: "application/json",
-        responseSchema: Sc.object({ properties: { store: Sc.string(), total: Sc.number(), subtotal: Sc.number(), taxIncluded: Sc.boolean(), items: Sc.array({ items: Sc.object({ properties: { name: Sc.string(), price: Sc.number(), rate: Sc.number(), kind: Sc.string() } }) }) } })
+        responseSchema: Sc.object({ properties: { store: Sc.string(), date: Sc.string(), total: Sc.number(), subtotal: Sc.number(), taxIncluded: Sc.boolean(), items: Sc.array({ items: Sc.object({ properties: { name: Sc.string(), price: Sc.number(), rate: Sc.number(), kind: Sc.string() } }) }) } })
       };
       if (level !== "plain") gc.thinkingConfig = { thinkingLevel: (m[1].ThinkingLevel && m[1].ThinkingLevel[level]) || level };
       return m[1].getGenerativeModel(ai, { model: AI_MODEL, generationConfig: gc });
@@ -952,6 +1108,7 @@
     "【税】taxIncluded は、品物の金額が税込で印字されている(内税)なら true、税抜(外税)で印字され、税が最後にまとめて加算されているなら false です。rate は、その品物の消費税率(8 または 10)です。「軽」「※」などの軽減税率の印や、税率ごとの内訳から判断し、分からなければ 10 にします。\n" +
     "【種類】kind は、品物の種類です。「食材」(冷蔵庫に入れる食品)、「日用品」(シャンプー・洗剤・ティッシュなどの消耗品)、「その他」のどれかにします。\n" +
     "【合計】total はレシートの合計(支払う金額・税込)、subtotal は小計です。印字がなければ 0 にします。store は店名です。\n" +
+    "【日付】date は、レシートに印字された購入日を、YYYY-MM-DD の形で入れます(例:2026-09-22)。和暦や省略は、西暦に直します。印字がない、または読めないときは、空文字にします。\n" +
     "【ルール】読み取れない行や、自信がない行は、推測で作らず、含めません。name は印字どおりの商品名にして、商品コードや余計な記号は除きます。レシートでない写真なら items を空にします。";
   function toB64(f) {
     return new Promise(function (ok, ng) {
@@ -974,17 +1131,60 @@
     items[k].price += d; return items;
   }
   /* AIの返事を、品物・合計に直す。gap = 品物の合計 − レシートの合計(0なら一致) */
+  /* レシートの日付を、安全な形にする(今日より先・1年より前は、使わない) */
+  function okRcDate(v) {
+    var re = /(20\d{2})\D{1,3}(\d{1,2})\D{1,3}(\d{1,2})/g, m, pad = function (x) { return ("0" + x).slice(-2) };
+    while ((m = re.exec(String(v || "")))) {
+      var t = okDate(m[1] + "-" + pad(m[2]) + "-" + pad(m[3]));
+      if (t && t <= today && t >= addDays(today, -366)) return t;
+    }
+    return "";
+  }
+  /* 税抜の金額を税込にするとき、端数の1円ずつを、小数点以下が大きい品物から順に割り振る */
+  function allocTax(items, total) {
+    if (!items.length || !total) return items;
+    var sum = items.reduce(function (a, x) { return a + x.price }, 0), dlt = total - sum;
+    if (dlt >= 0 && dlt <= items.length) {
+      items.slice().sort(function (a, b) { return (b.ex - Math.floor(b.ex)) - (a.ex - Math.floor(a.ex)) }).slice(0, dlt).forEach(function (x) { x.price += 1 });
+      return items;
+    }
+    return fitTotal(items, total);
+  }
   function parseAI(txt) {
     var d = JSON.parse(txt), excl = d.taxIncluded === false;
     var items = (d.items || []).map(function (x) {
-      var p = Math.round(Number(x.price)), rt = Number(x.rate) === 8 ? 8 : 10;
-      return { name: String(x.name || "").trim(), aiKind: String(x.kind || "").trim(), price: excl ? Math.floor(p * (100 + rt) / 100) : p };
+      var p = Math.round(Number(x.price)), rt = Number(x.rate) === 8 ? 8 : 10, ex = excl ? p * (100 + rt) / 100 : p;
+      return { name: String(x.name || "").trim(), aiKind: String(x.kind || "").trim(), ex: ex, price: Math.floor(ex) };
     }).filter(function (x) { return x.name && x.price > 0 && x.price <= 1000000 });
     var total = Math.round(Number(d.total)) || 0, sub = Math.round(Number(d.subtotal)) || 0, note = "";
-    if (excl) { note = "税抜の金額を税込に換算しました"; items = fitTotal(items, total) }
+    if (excl) { note = "税抜の金額を税込に換算しました"; items = allocTax(items, total) }
     var sum = items.reduce(function (a, x) { return a + x.price }, 0), target = excl ? total : (sub || total);
     if (!total) total = sum;
-    return { items: items, total: total, store: String(d.store || "").trim(), raw: txt, taxNote: note, gap: target ? sum - target : 0 };
+    return { items: items, total: total, store: String(d.store || "").trim(), date: okRcDate(d.date), raw: txt, taxNote: note, gap: target ? sum - target : 0 };
+  }
+  /* ---- AIのエラーを、人にわかる形にする ---- */
+  function aiWhy(err) {
+    var code = String(err && err.code || ""), msg = String(err && err.message || err || ""), st = err && err.customErrorData && err.customErrorData.status;
+    var m = msg.match(/\[(\d{3})\s*[^\]]*\]/); if (!st && m) st = +m[1];
+    return { code: code, status: Number(st) || 0, msg: msg.slice(0, 400), kind: /PerDay|per day|daily/i.test(msg) ? "day" : (/PerMinute|per minute|retry in/i.test(msg) ? "minute" : "") };
+  }
+  function aiHuman(w) {
+    if (w.status === 429) return w.kind === "day" ? "AIの1日の利用上限に、達したようです。日本時間の夕方(午後4〜5時ごろ)に、また使えます"
+      : w.kind === "minute" ? "AIの短時間の利用上限に、達したようです。1分ほど待つと、また使えます" : "AIの利用回数の上限に、達した可能性があります。しばらく待ってから、もう一度お試しください";
+    if ([500, 502, 503, 504].indexOf(w.status) >= 0) return "AIが混み合っています。少し待って、もう一度お試しください";
+    if (w.status === 403) return "AIの利用が許可されていません(App Check や Firebase の設定の確認が必要です)";
+    if (w.status === 404) return "AIのモデルが見つかりません(モデル名の更新が必要な可能性があります)";
+    if (w.status === 400) return "AIに送った内容が、受け付けられませんでした";
+    if (/Failed to fetch|NetworkError|Load failed/i.test(w.msg) || (w.code === "fetch-error" && !w.status)) return "AIと通信できませんでした。電波を確認するか、ブラウザの拡張機能(広告ブロックなど)をオフにして、もう一度お試しください";
+    return "AIの読み取りに失敗しました";
+  }
+  /* 混雑・一時的な通信エラーのときだけ、少し待って、もう一度試す(1回だけ) */
+  function callAI(model, parts) {
+    return model.generateContent(parts).catch(function (err) {
+      var w = aiWhy(err), temp = [500, 502, 503, 504].indexOf(w.status) >= 0 || (w.code === "fetch-error" && !w.status);   /* 429(上限)は、やり直さない */
+      if (!temp) throw err;
+      return new Promise(function (r) { setTimeout(r, 2500) }).then(function () { return model.generateContent(parts) });
+    });
   }
   function readAI(f, stage) {
     var model, img; stage = stage || function () { };
@@ -992,8 +1192,8 @@
     return Promise.all([loadAI("LOW"), toB64(f)]).then(function (a) {
       model = a[0]; img = { inlineData: { mimeType: "image/jpeg", data: a[1] } };
       stage("AIに送って、読み取っています");
-      return model.generateContent([AI_PROMPT, img]).catch(function (err) {
-        if (!AI_THINK || !/thinking|INVALID_ARGUMENT|400/i.test(String(err && (err.code || err.message) || err))) throw err;
+      return callAI(model, [AI_PROMPT, img]).catch(function (err) {
+        var w0 = aiWhy(err); if (!AI_THINK || !(w0.status === 400 || /thinking|INVALID_ARGUMENT/i.test(w0.msg))) throw err;
         AI_THINK = false; aiPs = {};   /* 「考える量」の指定が使えないときは、指定なしで、もう一度 */
         return loadAI().then(function (m2) { model = m2; return model.generateContent([AI_PROMPT, img]) });
       });
@@ -1002,7 +1202,7 @@
       if (!p.gap) return p;
       stage("合計が合わないため、丁寧に読み直しています");
       var q = "前回の読み取り結果:\n" + txt + "\n\n問題: 品物の金額の合計が、レシートの小計・合計より " + Math.abs(p.gap) + "円 " + (p.gap > 0 ? "多い" : "少ない") + "です。写真をもう一度よく見て、読み間違い・抜け・余計な行(合計や税の行を品物にしていないか)を直した結果を、同じ形式のJSONで返してください。";
-      return loadAI("MEDIUM").then(function (m3) { return m3.generateContent([AI_PROMPT, img, q]) }).then(function (r2) {   /* 速い設定で合わなかったときだけ、丁寧な設定で読み直す */
+      return loadAI("MEDIUM").then(function (m3) { return callAI(m3, [AI_PROMPT, img, q]) }).then(function (r2) {   /* 速い設定で合わなかったときだけ、丁寧な設定で読み直す */
         var p2 = parseAI(r2.response.text()); p2.retried = true;
         if (Math.abs(p2.gap) <= Math.abs(p.gap)) return p2;
         p.retried = true; return p;
@@ -1013,9 +1213,16 @@
     return loadOCR().then(function () { return Promise.all([getWorker(), prep(f)]) }).then(function (a) {
       $("rcMsg").textContent = "読み取り中…"; return a[0].recognize(a[1]);
     }).then(function (r) {
-      var p = parseReceipt(r.data.text); p.raw = r.data.text; p.store = "";
-      var sm = p.items.reduce(function (a, x) { return a + x.price }, 0), f = sm ? p.total / sm : 0;
-      if (/外税|税抜|税別/.test(r.data.text) && f > 1.03 && f < 1.11) {
+      var p = parseReceipt(r.data.text); p.raw = r.data.text; p.store = ""; p.date = okRcDate(r.data.text);
+      var mxp = p.items.reduce(function (a, x) { return Math.max(a, x.price) }, 0);
+      if (p.total && p.items.length && p.total < mxp) { p.total = 0; p.suspect = true }   /* 合計が、品物の最高額より小さいのは、読み間違い */
+      var sm = p.items.reduce(function (a, x) { return a + x.price }, 0), f = sm ? p.total / sm : 0, done = false;
+      if (p.excl && p.total) {   /* 外税のレシート: 品物ごとの税率(※は8%)で税込にして、合計に合わせる */
+        var it2 = p.items.map(function (x) { var rt = p.only8 ? 8 : p.only10 ? 10 : (x.red ? 8 : 10), ex = x.price * (100 + rt) / 100; return { name: x.name, price: Math.floor(ex), ex: ex } });
+        var s2 = it2.reduce(function (a, x) { return a + x.price }, 0);
+        if (p.total >= s2 && p.total - s2 <= it2.length) { p.items = allocTax(it2, p.total); p.taxNote = "税抜の金額を税込に換算しました"; done = true }
+      }
+      if (!done && /外税|税抜|税別/.test(r.data.text) && f > 1.03 && f < 1.11) {
         p.items = fitTotal(p.items.map(function (x) { return { name: x.name, price: Math.floor(x.price * f) } }), p.total);
         p.taxNote = "税抜の金額を、合計に合わせて税込に換算しました(概算)";
       }
@@ -1025,23 +1232,52 @@
   function showRc(p, ai, note) {
     rcItems = p.items.map(function (x) { return { name: x.name, price: x.price, kind: kindOf(x.name, x.aiKind) } });
     rcOrig = { ai: !!ai, retried: !!p.retried, total: p.total || 0, secs: 0, items: rcItems.map(function (x) { return x.name + "|" + x.price }) };   /* 読み取り直後の内容(あとで、どれだけ直したかを数える) */ $("rcRaw").textContent = (note ? "[" + note + "]\n" : "") + p.raw;
-    $("rcTotal").value = p.total || ""; $("rcMemo").value = p.store || ""; $("rcDate").value = today;
+    $("rcTotal").value = p.total || ""; $("rcMemo").value = p.store || ""; $("rcDate").value = p.date || today;
     renderRc(); $("rcRes").classList.remove("hidden");
     $("rcMsg").textContent = !p.items.length ? "品物を読み取れませんでした。レシート全体が写るように、明るい場所で撮り直してください"
-      : (ai ? "AIで読み取りました。" : "簡易読み取りです(精度が低いため、必ず内容を確認してください)。") + (p.retried ? "合計が合わなかったため、AIが読み直しました。" : "") + (p.taxNote ? p.taxNote + "。" : "") + "内容を確認して登録してください";
+      : (ai ? "AIで読み取りました。" : "簡易読み取りです(精度が低いため、必ず内容を確認してください)。") + (p.retried ? "合計が合わなかったため、AIが読み直しました。" : "") + (p.taxNote ? p.taxNote + "。" : "") + (p.date && p.date !== today ? "レシートの日付(" + (+p.date.slice(5, 7)) + "/" + (+p.date.slice(8)) + ")を、支出の日付に入れました。" : "") + (p.suspect ? "合計を読み取れませんでした。レシートの合計を、入力してください。" : "") + "内容を確認して登録してください";
+  }
+  /* ---- AIの利用上限(429)に達したとき: しばらくAIを呼ばず、すぐ簡易読み取りに切り替える ---- */
+  function aiBlockUntil() { try { var t = +localStorage.getItem("ls_ai_block") || 0; return t > Date.now() ? t : 0 } catch (e) { return 0 } }
+  function msToPacificMidnight() {   /* 1日の上限は、アメリカ太平洋時間の0時に、リセットされる(公式の説明) */
+    try {
+      var p = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", hour12: false, hour: "numeric", minute: "numeric", second: "numeric" }).formatToParts(new Date()), g = function (t) { return +p.filter(function (x) { return x.type === t })[0].value % 24 };
+      return (86400 - (g("hour") * 3600 + g("minute") * 60 + g("second"))) * 1000 + 60000;
+    } catch (e) { return 6 * 3600 * 1000 }
+  }
+  function setAiBlock(w) {
+    if (w.status !== 429) return;
+    var ms = 60000, m = w.msg.match(/retry in\s*([\d.]+)\s*s/i) || w.msg.match(/retryDelay"?\s*:\s*"?(\d+)s/i);
+    if (m) ms = Math.max(5000, Math.ceil(parseFloat(m[1]) * 1000) + 2000);
+    if (w.kind === "day") ms = msToPacificMidnight();
+    try { localStorage.setItem("ls_ai_block", String(Date.now() + Math.min(ms, 24 * 3600 * 1000))) } catch (e) { }
+  }
+  function blockText(t) {
+    var min = Math.ceil((t - Date.now()) / 60000); if (min < 60) return "約" + Math.max(1, min) + "分後";
+    var d = new Date(t); return d.getHours() + "時" + ("0" + d.getMinutes()).slice(-2) + "分ごろ";
   }
   function runRc(f, useAI) {
     var t0 = Date.now(), label = "", tick = null, sec = function () { return Math.round((Date.now() - t0) / 1000) };
+    var bl = useAI ? aiBlockUntil() : 0, blNote = ""; if (bl) { useAI = false; blNote = "AIは、利用上限のため、" + blockText(bl) + "まで、お休み中です。簡易読み取りで読み取ります。" }
     function show() { $("rcMsg").textContent = label + "…(" + sec() + "秒)" }
     function stage(t) { label = t; show() }
     function stop() { clearInterval(tick) }
     if (useAI) { stage("準備しています"); tick = setInterval(show, 1000) } else $("rcMsg").textContent = "準備中…(初回は日本語データの読み込みで少し時間がかかります)";
     (useAI ? readAI(f, stage).then(function (p) { stop(); showRc(p, true); if (rcOrig) rcOrig.secs = sec(); $("rcMsg").textContent = $("rcMsg").textContent.replace("AIで読み取りました。", "AIで読み取りました(" + sec() + "秒)。") }, function (err) {
       stop();
-      var why = "AI読み取りエラー: " + String(err && (err.code || err.message) || err);
-      $("rcMsg").textContent = "AI読み取りを使えませんでした(Firebase の AI Logic の設定が必要です)。簡易読み取りに切り替えます…";
-      return readTess(f).then(function (p) { showRc(p, false, why) });
-    }) : readTess(f).then(function (p) { showRc(p, false) }))
+      var w = aiWhy(err), human = aiHuman(w); setAiBlock(w);
+      var why = "AI読み取りエラー: " + (w.code || "不明") + (w.status ? " (HTTP " + w.status + ")" : "") + " / " + w.msg;
+      $("rcMsg").textContent = human + "。簡易読み取りに切り替えます…";
+      return readTess(f).then(function (p) { showRc(p, false, why); $("rcMsg").textContent = human + "。" + $("rcMsg").textContent });
+    }) : readTess(f).then(function (p) {
+      showRc(p, false, blNote ? "AIの利用上限のため、簡易読み取りに切り替えました" : "");
+      if (blNote) {
+        $("rcMsg").textContent = blNote + $("rcMsg").textContent;
+        var again = document.createElement("button"); again.type = "button"; again.className = "linkbtn"; again.textContent = "AIをもう一度、試す";
+        again.addEventListener("click", function () { try { localStorage.removeItem("ls_ai_block") } catch (e) { } runRc(f, true) });
+        $("rcMsg").appendChild(document.createTextNode(" ")); $("rcMsg").appendChild(again);
+      }
+    }))
       .catch(function () {
         stop(); rcWorker = null; rcOrig = null; rcItems = []; $("rcTotal").value = ""; $("rcMemo").value = ""; $("rcDate").value = today; renderRc(); $("rcRes").classList.remove("hidden");
         $("rcMsg").textContent = "読み取れませんでした。撮り直すか、下に手入力してください";
@@ -1052,8 +1288,10 @@
     $("rcRes").classList.add("hidden");
     var ok = false; try { ok = localStorage.getItem("ls_ai_ok") === "1" } catch (x) { }
     if (ok) { runRc(f, true); return }
-    openDialog({ title: "写真をAIに送ります", msg: "レシートの写真を、GoogleのAI(Gemini)に送って読み取ります。\nカード番号や会員番号などが写っている場合は、隠してから撮ってください。\n「送らない」を選ぶと、端末の中だけで読み取る簡易読み取りを使います(精度は低めです)。", noEsc: true,
-      buttons: [{ label: "送らない(端末内で読み取る)", fn: function () { runRc(f, false) } }, { label: "送って読み取る", primary: true, fn: function () { try { localStorage.setItem("ls_ai_ok", "1") } catch (x) { } runRc(f, true) } }] });
+    openDialog({
+      title: "写真をAIに送ります", msg: "レシートの写真を、GoogleのAI(Gemini)に送って読み取ります。\nカード番号や会員番号などが写っている場合は、隠してから撮ってください。\n「送らない」を選ぶと、端末の中だけで読み取る簡易読み取りを使います(精度は低めです)。", noEsc: true,
+      buttons: [{ label: "送らない(端末内で読み取る)", fn: function () { runRc(f, false) } }, { label: "送って読み取る", primary: true, fn: function () { try { localStorage.setItem("ls_ai_ok", "1") } catch (x) { } runRc(f, true) } }]
+    });
   });
   /* ---- AIの読み取りの成績(この端末にだけ記録。写真や中身は、残さない) ---- */
   function logRc(total) {
@@ -1076,14 +1314,14 @@
   }
   function registerReceipt(a) {
     logRc(a);
-    var d = $("rcDate").value || today, nf = 0, nd = 0;
+    var d = $("rcDate").value || today, nf = 0, nd = 0, skip = 0;
     rcItems.forEach(function (x) {
       var nm = cleanStr(x.name, 50); if (!nm || x.price < 0) return;
-      if (x.kind === "食材") { if (addFridge(nm, d)) nf++ } else if (x.kind === "日用品") { addStock(nm, d); nd++ }
+      if (x.kind === "食材") { if (addFridge(nm, d)) nf++; else skip++ } else if (x.kind === "日用品") { addStock(nm, d); nd++ }
     });
     S.exp.push({ id: uid(), date: d, amt: a, memo: cleanStr($("rcMemo").value, 100) || "レシート", cat: $("rcCat").value });
     save(); renderAll(); $("rcRes").classList.add("hidden");
-    $("rcMsg").textContent = (d === today ? "今日の支出に登録しました" : d + " の支出として登録しました") + (nf || nd ? "。冷蔵庫に" + nf + "品(賞味期限は目安)、日用品に" + nd + "品を入れました" : "");
+    $("rcMsg").textContent = (d === today ? "今日の支出に登録しました" : d + " の支出として登録しました") + (nf || nd ? "。冷蔵庫に" + nf + "品(賞味期限は目安)、日用品に" + nd + "品を入れました" : "") + (skip ? "。日付が古く、期限が過ぎる食材 " + skip + "品は、冷蔵庫に入れませんでした" : "");
   }
   renderRcStats();
   $("rcAdd").addEventListener("click", function () {
@@ -1223,9 +1461,11 @@
     if (!cuid || syncPaused) return; try { localStorage.setItem("ls_dirty", "1") } catch (e) { } setSync("同期中…"); clearTimeout(timer);
     timer = setTimeout(function () { push().then(pushOk).catch(pushFail) }, 700);
   }
-  var AUTHMSG = { "auth/invalid-credential": "メールアドレスまたはパスワードが違います。入力を確認してください", "auth/wrong-password": "パスワードが違います。入力を確認するか、「パスワードを忘れた」を使ってください", "auth/user-not-found": "このメールアドレスは登録されていません。「新規登録」を押してください",
+  var AUTHMSG = {
+    "auth/invalid-credential": "メールアドレスまたはパスワードが違います。入力を確認してください", "auth/wrong-password": "パスワードが違います。入力を確認するか、「パスワードを忘れた」を使ってください", "auth/user-not-found": "このメールアドレスは登録されていません。「新規登録」を押してください",
     "auth/invalid-email": "メールアドレスの形式が正しくありません。(例:name@example.com)", "auth/email-already-in-use": "このメールアドレスは、すでに登録されています。「ログイン」を押してください", "auth/weak-password": "パスワードは、6文字以上にしてください",
-    "auth/network-request-failed": "通信できません。電波の良い場所で、もう一度試してください", "auth/too-many-requests": "試した回数が多すぎます。しばらく待ってから、もう一度試してください", "auth/operation-not-allowed": "メールとパスワードでのログインが、まだ有効になっていません(管理者の設定が必要です)", "auth/user-disabled": "このアカウントは、使えない状態です", "auth/missing-password": "パスワードを入力してください" };
+    "auth/network-request-failed": "通信できません。電波の良い場所で、もう一度試してください", "auth/too-many-requests": "試した回数が多すぎます。しばらく待ってから、もう一度試してください", "auth/operation-not-allowed": "メールとパスワードでのログインが、まだ有効になっていません(管理者の設定が必要です)", "auth/user-disabled": "このアカウントは、使えない状態です", "auth/missing-password": "パスワードを入力してください"
+  };
   function authErr(e) { $("authMsg").textContent = AUTHMSG[e && e.code] || ("うまくいきませんでした。通信を確認して、もう一度お試しください(コード: " + (e && (e.code || e.message) || "不明") + ")") }
   /* ---- ゲスト(この端末)のデータと、クラウドのデータが、ちがうときの扱い ---- */
   function hasData(x) { return !!(x.budget || x.memo || x.exp.length || x.todos.length || x.rec.length || x.sched.length || x.fridge.length || x.shop.length || x.fixed.length || x.stock.length || Object.keys(x.meals).length || Object.keys(x.trash).length || Object.keys(x.codes).length) }
@@ -1248,9 +1488,11 @@
     var backup = JSON.stringify(localS); try { localStorage.setItem("ls_backup_login", backup) } catch (e) { }
     syncPaused = true;
     function adopt(st, msg) { syncPaused = false; useState(st, msg); showToast(msg, function () { S = withDef(JSON.parse(backup)); save(); renderAll(); $("memo").value = S.memo }) }
-    openDialog({ title: "データの扱いを選んでください", noEsc: true,
+    openDialog({
+      title: "データの扱いを選んでください", noEsc: true,
       msg: "この端末のデータと、クラウドのデータが、ちがっています。\nこの端末:" + sumTxt(localS) + "\nクラウド:" + sumTxt(cloud) + "\nどれを使いますか?(選んだあとも、「元に戻す」で、この端末のデータに戻せます)",
-      buttons: [{ label: "クラウドのデータを使う", fn: function () { adopt(cloud, "クラウドのデータを使いました") } }, { label: "この端末のデータを使う", fn: function () { adopt(localS, "この端末のデータを使いました") } }, { label: "両方を統合する(おすすめ)", primary: true, fn: function () { adopt(mergeStates(localS, cloud), "両方のデータを統合しました") } }] });
+      buttons: [{ label: "クラウドのデータを使う", fn: function () { adopt(cloud, "クラウドのデータを使いました") } }, { label: "この端末のデータを使う", fn: function () { adopt(localS, "この端末のデータを使いました") } }, { label: "両方を統合する(おすすめ)", primary: true, fn: function () { adopt(mergeStates(localS, cloud), "両方のデータを統合しました") } }]
+    });
   }
   function loadCloud() {
     setSync("読み込み中…");
